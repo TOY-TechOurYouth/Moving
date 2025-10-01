@@ -4,7 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from collections import Counter, defaultdict
 
-OUTPUT_DIR = r"C:\Users\user\PycharmProjects\emotion_subtitle_improve\sample_test_1"
+OUTPUT_DIR = r"C:\Users\user\PycharmProjects\emotion_subtitle_improve\sample_test_1-2"
 CSV_PATH   = os.path.join(OUTPUT_DIR, "words_emotion_pitch.csv")
 
 df = pd.read_csv(CSV_PATH)
