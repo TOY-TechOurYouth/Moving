@@ -165,14 +165,25 @@ def main():
     words_full = emotion_probs_per_words(
         y, sr, words_pitch,
         model_id=EMO_MODEL_ID,
-        pad_s=0.05, target_len_sec=30.0, batch_size=64
+        target_duration=5.0,
+        batch_size=64
     )
 
-    # 6) 최종 저장
+    # 6) 최종 저장: 요청한 10개 컬럼만
+    final_cols = [
+        "start","end","word","speaker",
+        "emo_label","emo_entropy","emo_probs",
+        "pitch_label","pitch_entropy","pitch_probs"
+    ]
+
+    # 혹시 누락 컬럼이 있을 수 있으니 방어적으로 교차
+    final_cols = [c for c in final_cols if c in words_full.columns]
+    words_compact = words_full[final_cols].copy()
+
     out_csv = os.path.join(OUTPUT_DIR, "words_emotion_pitch.csv")
-    write_csv(words_full, out_csv)
-    preview(words_full, "최종 단어별 결과")
-    print("✅ Done (per-word).")
+    write_csv(words_compact, out_csv)
+    preview(words_compact, "최종 단어별 결과 (compact)")
+    print("✅ Done (per-word, compact 10-cols).")
 
 if __name__ == "__main__":
     main()

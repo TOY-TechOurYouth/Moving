@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 from typing import List, Tuple, Dict, Optional
 
+import json
 import numpy as np
 import pandas as pd
 import librosa
@@ -258,52 +259,47 @@ def label_speakers_by_word_hybrid(
 
 def classify_pitch_per_word(
     words_labeled: pd.DataFrame,
-    speaker_baselines: Dict[str, float],
+    speaker_baselines: dict,
     delta_st: float = 2.0,
     sigma: float = 1.2
 ) -> pd.DataFrame:
 
     out = words_labeled.copy()
 
-    lows, mids, highs, tops, ents, semis = [], [], [], [], [], []
+    pitch_labels, pitch_ents, pitch_semis, pitch_probs_json = [], [], [], []
 
-    # 단어 단위로 순회
     for _, w in out.iterrows():
         spk = str(w.get("speaker", "unknown"))
         wp = w.get("median_pitch", np.nan)
         base = speaker_baselines.get(spk, np.nan)
 
         if not np.isfinite(wp) or not np.isfinite(base) or base <= 0:
-            # 버려질 단어들을 'mid'로 강제 분류
             low, mid, high = 0.0, 1.0, 0.0
             semi = np.nan
         else:
-            # baseline 대비 세미톤 차이 계산
             semi = 12.0 * np.log2(float(wp) / float(base))
-            # 가우시안 점수 (중심: -Δ, 0, +Δ)
             low_s  = np.exp(-0.5 * ((semi - (-delta_st)) / sigma) ** 2)
             mid_s  = np.exp(-0.5 * ((semi - 0.0)       / sigma) ** 2)
             high_s = np.exp(-0.5 * ((semi - (+delta_st)) / sigma) ** 2)
-            # 합으로 정규화 (softmax 처럼)
             ssum = low_s + mid_s + high_s + 1e-9
             low, mid, high = low_s / ssum, mid_s / ssum, high_s / ssum
 
-        # 확률 벡터 및 엔트로피 계산
         probs = np.array([low, mid, high], dtype=float)
         ent = float(-(probs * np.log(probs + 1e-9)).sum())
-        # 확률 최대값에 해당하는 라벨 선택
         label = ["low", "mid", "high"][int(probs.argmax())]
 
-        lows.append(float(low)); mids.append(float(mid)); highs.append(float(high))
-        tops.append(label); ents.append(ent); semis.append(float(semi))
+        pitch_labels.append(label)
+        pitch_ents.append(ent)
+        pitch_semis.append(float(semi))
+        pitch_probs_json.append(json.dumps({"low": float(low),
+                                            "mid": float(mid),
+                                            "high": float(high)}, ensure_ascii=False))
 
-    # 결과 컬럼 추가 후 반환
-    out["pitch_low"]      = lows
-    out["pitch_mid"]      = mids
-    out["pitch_high"]     = highs
-    out["pitch_label"]    = tops
-    out["pitch_entropy"]  = ents
-    out["pitch_semitone"] = semis
+    # ✅ 최종 필요한 컬럼만 추가
+    out["pitch_label"]    = pitch_labels
+    out["pitch_entropy"]  = pitch_ents
+    out["pitch_probs"]    = pitch_probs_json
+    #out["pitch_semitone"] = pitch_semis  # (원하면 사용. 최종 CSV에선 제외 가능)
 
     return out
 

@@ -1,22 +1,11 @@
+import json
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 import librosa
-from dataclasses import dataclass
-from typing import List
 from transformers import AutoModelForAudioClassification, AutoFeatureExtractor
 
-# ---------------------------
-# 감정 프레임 인퍼런스(기존 유지)
-# ---------------------------
-@dataclass
-class EmotionFrames:
-    times: np.ndarray   # 각 프레임 중앙 시간
-    probs: np.ndarray   # (N, C)
-    rms: np.ndarray     # RMS 가중치
-    labels: List[str]   # 클래스명
-
-# (로컬 유틸) 오디오를 단일 채널(mono) & 지정된 샘플링레이트로 변환
 def ensure_mono_sr(y, sr, target_sr=16000):
     if y.ndim == 2:
         y = librosa.to_mono(y.T)
@@ -25,74 +14,106 @@ def ensure_mono_sr(y, sr, target_sr=16000):
         sr = target_sr
     return y, sr
 
-# (로컬 유틸) 프레임 RMS
-def rms_per_frame(frames: np.ndarray) -> np.ndarray:
-    return np.sqrt((frames**2).mean(axis=1)) if len(frames) else np.array([])
-
-# 오디오를 win_s, hop_s 단위로 프레임 분할
-def frame_audio(y: np.ndarray, sr: int, win_s: float, hop_s: float):
-    win = int(win_s * sr)
-    hop = int(hop_s * sr)
-    frames, centers = [], []
-    for start in range(0, max(1, len(y) - win + 1), hop):
-        end = start + win
-        if end > len(y):
-            break
-        frames.append(y[start:end])
-        centers.append((start + end) / 2 / sr)
-    frames = np.stack(frames) if frames else np.empty((0,))
-    centers = np.array(centers, dtype=float)
-    rms = rms_per_frame(frames)
-    return frames, centers, rms
-
 def _get_sampling_rate(fe) -> int:
     fe_like = getattr(fe, "feature_extractor", fe)
     return getattr(fe_like, "sampling_rate", 16000)
 
-# 감정 모델을 사용해 프레임별 감정 확률 계산
-def emotion_frame_probs(y: np.ndarray, sr: int, model_id: str,
-                        win_s: float = 0.5, hop_s: float = 0.25) -> EmotionFrames:
+def extract_word_centered_segment(y: np.ndarray, sr: int,
+                                  word_start: float, word_end: float,
+                                  target_duration: float = 5.0) -> np.ndarray:
+    word_center = (word_start + word_end) / 2.0
+    word_center_sample = int(word_center * sr)
+    half_len = int(target_duration * sr / 2)
+    start_sample = word_center_sample - half_len
+    end_sample = word_center_sample + half_len
+    audio_len = len(y)
+
+    if start_sample < 0:
+        segment = y[:int(target_duration * sr)]
+        if len(segment) < int(target_duration * sr):
+            padded = np.zeros(int(target_duration * sr), dtype=y.dtype)
+            padded[:len(segment)] = segment
+            return padded
+        return segment
+    elif end_sample > audio_len:
+        segment = y[-int(target_duration * sr):]
+        if len(segment) < int(target_duration * sr):
+            padded = np.zeros(int(target_duration * sr), dtype=y.dtype)
+            padded[:len(segment)] = segment
+            return padded
+        return segment
+    else:
+        return y[start_sample:end_sample]
+
+def emotion_probs_per_words(y: np.ndarray, sr: int, words_df: pd.DataFrame,
+                            model_id: str,
+                            target_duration: float = 5.0,
+                            batch_size: int = 32) -> pd.DataFrame:
+    print(f"🧠 단어 중심 {target_duration}초 구간 감정 분석 시작...")
+
     fe = AutoFeatureExtractor.from_pretrained(model_id)
     model = AutoModelForAudioClassification.from_pretrained(model_id)
     model.eval()
 
     target_sr = _get_sampling_rate(fe)
-    required_len = int(target_sr * 30.0)  # Whisper 입력 고정 30초
+    required_samples = int(target_sr * target_duration)
     y, sr = ensure_mono_sr(y, sr, target_sr=target_sr)
-
-    frames, centers, rms = frame_audio(y, sr, win_s, hop_s)
-    if frames.size == 0:
-        num_labels = getattr(model.config, "num_labels", 0)
-        return EmotionFrames(np.array([]), np.zeros((0, num_labels)), np.array([]), [])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
+
+    emotion_labels = [model.config.id2label[i] for i in range(model.config.num_labels)]
+
+    total_words = len(words_df)
+    batch_segments, batch_indices = [], []
     all_probs = []
-    BS = 64
 
-    for i in range(0, len(frames), BS):
-        batch_raw = frames[i:i+BS]
-        # 고정 30초 패딩
-        padded = []
-        for f in batch_raw:
-            f = np.asarray(f, dtype=np.float32)
-            if len(f) >= required_len:
-                padded.append(f[:required_len])
-            else:
-                pad = np.zeros(required_len, dtype=np.float32)
-                pad[:len(f)] = f
-                padded.append(pad)
+    for idx, row in words_df.iterrows():
+        seg = extract_word_centered_segment(y, sr, row['start'], row['end'], target_duration)
+        if len(seg) < required_samples:
+            padded = np.zeros(required_samples, dtype=np.float32)
+            padded[:len(seg)] = seg
+            seg = padded
+        elif len(seg) > required_samples:
+            seg = seg[:required_samples]
 
-        inputs = fe(padded, sampling_rate=sr, return_tensors="pt")
-        if isinstance(inputs, dict) and "attention_mask" in inputs:
-            inputs.pop("attention_mask", None)
+        batch_segments.append(seg)
+        batch_indices.append(idx)
 
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
-            logits = model(**inputs).logits
-            probs = F.softmax(logits, dim=-1).detach().cpu().numpy()
-            all_probs.append(probs)
+        if len(batch_segments) == batch_size or idx == words_df.index[-1]:
+            inputs = fe(batch_segments, sampling_rate=target_sr, return_tensors="pt")
+            if isinstance(inputs, dict) and "attention_mask" in inputs:
+                inputs.pop("attention_mask", None)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    probs = np.concatenate(all_probs, axis=0)
-    labels = [model.config.id2label[i] for i in range(probs.shape[1])]
-    return EmotionFrames(centers, probs, rms, labels)
+            with torch.no_grad():
+                logits = model(**inputs).logits
+                probs = F.softmax(logits, dim=-1).detach().cpu().numpy()
+
+            all_probs.extend(list(probs))
+            batch_segments, batch_indices = [], []
+
+    probs_array = np.asarray(all_probs, dtype=float)  # shape: (N_words, N_emotions)
+
+    # 🔻 여기서부터 "압축 컬럼"만 생성
+    # emo_probs: {"anger":0.12,"fear":0.03,...} 같은 JSON 문자열
+    emo_probs_json = []
+    emo_top_labels = []
+    emo_entropy = []
+
+    for pv in probs_array:
+        # dict(label->prob)
+        d = {emotion_labels[i]: float(pv[i]) for i in range(len(emotion_labels))}
+        emo_probs_json.append(json.dumps(d, ensure_ascii=False))
+        emo_top_labels.append(emotion_labels[int(np.argmax(pv))])
+        # Shannon entropy (ln)
+        ent = float(-(pv * np.log(pv + 1e-9)).sum())
+        emo_entropy.append(ent)
+
+    # ✅ 최종 컬럼만 추가 (기존 per-label 확률/confidence 컬럼 생성 안 함)
+    words_df["emo_label"] = emo_top_labels
+    words_df["emo_entropy"] = emo_entropy
+    words_df["emo_probs"] = emo_probs_json
+
+    print(f"✅ 단어별 감정 분석 완료: {total_words}개 단어")
+    return words_df
